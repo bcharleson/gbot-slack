@@ -3,6 +3,7 @@
 .env.*
 *.token
 bot-token
+app-token
 .config/
 .credentials/
 credentials
