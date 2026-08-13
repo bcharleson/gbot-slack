@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import json
 import os
 import signal
@@ -13,13 +14,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set
 
 SLACK_API = "https://slack.com/api"
-DEFAULT_TOKEN_PATH = Path.home() / ".config" / "gbot-slack" / "bot-token"
-DEFAULT_APP_TOKEN_PATH = Path.home() / ".config" / "gbot-slack" / "app-token"
-USER_AGENT = "gbot-slack/2.0"
+DEFAULT_CONFIG_DIR = Path.home() / ".config" / "gbot-slack"
+DEFAULT_TOKEN_PATH = DEFAULT_CONFIG_DIR / "bot-token"
+DEFAULT_APP_TOKEN_PATH = DEFAULT_CONFIG_DIR / "app-token"
+DEFAULT_PIDFILE = DEFAULT_CONFIG_DIR / "gateway.pid"
+USER_AGENT = "gbot-slack/3.0"
+VERSION = "3.0"
 DEFAULT_THINKING_STATUS = "is thinking..."
+
+# Known Events API types we intentionally do not wake on (not "unknown").
+KNOWN_IGNORE_EVENT_TYPES = frozenset({"assistant_thread_context_changed"})
 
 
 class SlackError(Exception):
@@ -309,7 +316,8 @@ def cmd_mentions(token: str, args: argparse.Namespace) -> int:
         if any(code in detail for code in ("missing_scope", "not_allowed_token_type")):
             print(
                 "search.messages is unavailable for this token (common for bot tokens).\n"
-                "Prefer Socket Mode listen for mentions, or poll history:\n"
+                "Prefer Socket Mode gateway/listen for mentions, or poll history:\n"
+                "  - gbot-slack gateway --once\n"
                 "  - gbot-slack listen [--once]\n"
                 "  - invite the bot to channels of interest\n"
                 "  - use: gbot-slack history CHANNEL [limit]\n"
@@ -404,6 +412,55 @@ def cmd_thinking(token: str, args: argparse.Namespace) -> int:
     return 0
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_pidfile(path: Path = DEFAULT_PIDFILE) -> Path:
+    """Exclusive single-instance lock for Socket Mode (Slack load-balances connections)."""
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.is_file():
+        raw = path.read_text(encoding="utf-8").strip()
+        try:
+            existing = int(raw)
+        except ValueError:
+            existing = -1
+        if existing != os.getpid() and _pid_is_alive(existing):
+            raise SlackError(
+                f"Another gbot-slack gateway/listen is already running (pid {existing}, "
+                f"pidfile {path}). Stop that process first — Slack Socket Mode "
+                "load-balances events across connections, so multiple listeners steal events."
+            )
+    path.write_text(f"{os.getpid()}\n", encoding="utf-8")
+
+    def _cleanup() -> None:
+        release_pidfile(path)
+
+    atexit.register(_cleanup)
+    return path
+
+
+def release_pidfile(path: Path = DEFAULT_PIDFILE) -> None:
+    path = path.expanduser()
+    try:
+        if not path.is_file():
+            return
+        raw = path.read_text(encoding="utf-8").strip()
+        if raw == str(os.getpid()):
+            path.unlink()
+    except OSError:
+        pass
+
+
 def _is_retry_envelope(envelope: Dict[str, Any]) -> bool:
     if envelope.get("retry_attempt") is not None:
         return True
@@ -412,8 +469,50 @@ def _is_retry_envelope(envelope: Dict[str, Any]) -> bool:
     return False
 
 
-def _user_message_summary(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return a compact summary for message / app_mention Events API envelopes."""
+def _event_log_fields(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Safe summary fields for events-log (never tokens)."""
+    assistant = event.get("assistant_thread") or {}
+    return {
+        "type": event.get("type"),
+        "subtype": event.get("subtype"),
+        "user": event.get("user") or assistant.get("user_id"),
+        "text": event.get("text"),
+        "thread_ts": event.get("thread_ts") or assistant.get("thread_ts"),
+        "channel": event.get("channel") or assistant.get("channel_id"),
+        "bot_id": event.get("bot_id"),
+    }
+
+
+def append_events_log(path: Path, envelope: Dict[str, Any]) -> None:
+    payload = envelope.get("payload") or {}
+    event = payload.get("event") if isinstance(payload, dict) else None
+    if not isinstance(event, dict):
+        event = {}
+    row = {
+        "envelope_type": envelope.get("type"),
+        **_event_log_fields(event),
+    }
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        json.dump(row, handle, sort_keys=True, separators=(",", ":"))
+        handle.write("\n")
+
+
+def _human_event_summary(
+    envelope: Dict[str, Any],
+    *,
+    self_user_id: Optional[str] = None,
+    self_bot_id: Optional[str] = None,
+    allow_from: Optional[Iterable[str]] = None,
+    on_unknown: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a compact summary for a human Events API wake event, or None to ignore.
+
+    Ignores: retries, message subtypes, bot_id senders, the bot's own user_id,
+    and humans not on allow_from (when that list is non-empty).
+    Thread replies in DMs (message + thread_ts, no subtype) are kept.
+    """
     if envelope.get("type") != "events_api":
         return None
     if _is_retry_envelope(envelope):
@@ -421,21 +520,77 @@ def _user_message_summary(envelope: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     payload = envelope.get("payload") or {}
     event = payload.get("event") or {}
     event_type = event.get("type")
-    if event_type == "app_mention":
-        pass
-    elif event_type == "message":
-        if event.get("subtype"):
-            return None
-    else:
+    if not event_type:
         return None
+
+    if event_type == "assistant_thread_started":
+        assistant = event.get("assistant_thread") or {}
+        user = assistant.get("user_id") or event.get("user")
+        if not user:
+            return None
+        channel = assistant.get("channel_id") or event.get("channel")
+        thread_ts = assistant.get("thread_ts") or event.get("thread_ts")
+        text = event.get("text")
+        ts = event.get("ts") or thread_ts
+        bot_id = event.get("bot_id")
+    elif event_type in {"message", "app_mention"}:
+        if event_type == "message" and event.get("subtype"):
+            return None
+        user = event.get("user")
+        bot_id = event.get("bot_id")
+        channel = event.get("channel")
+        ts = event.get("ts")
+        text = event.get("text")
+        thread_ts = event.get("thread_ts")
+    elif event_type in KNOWN_IGNORE_EVENT_TYPES:
+        return None
+    else:
+        if on_unknown is not None:
+            on_unknown(str(event_type))
+        return None
+
+    if bot_id:
+        return None
+    if self_bot_id and (user == self_bot_id or bot_id == self_bot_id):
+        return None
+    if self_user_id and user == self_user_id:
+        return None
+    if not user:
+        return None
+
+    allowed: Optional[Set[str]] = None
+    if allow_from is not None:
+        allowed = {item for item in allow_from if item}
+        if allowed and user not in allowed:
+            return None
+
     return {
         "type": event_type,
-        "channel": event.get("channel"),
-        "user": event.get("user") or event.get("bot_id"),
-        "ts": event.get("ts"),
-        "text": event.get("text"),
-        "thread_ts": event.get("thread_ts"),
+        "event_type": event_type,
+        "channel": channel,
+        "user": user,
+        "ts": ts,
+        "text": text,
+        "thread_ts": thread_ts,
     }
+
+
+# Backward-compatible name used by older call sites / tests.
+def _user_message_summary(
+    envelope: Dict[str, Any],
+    *,
+    self_user_id: Optional[str] = None,
+    self_bot_id: Optional[str] = None,
+    allow_from: Optional[Iterable[str]] = None,
+    on_unknown: Optional[Callable[[str], None]] = None,
+) -> Optional[Dict[str, Any]]:
+    return _human_event_summary(
+        envelope,
+        self_user_id=self_user_id,
+        self_bot_id=self_bot_id,
+        allow_from=allow_from,
+        on_unknown=on_unknown,
+    )
 
 
 def _open_socket_url(app_token: str) -> str:
@@ -446,75 +601,210 @@ def _open_socket_url(app_token: str) -> str:
     return url
 
 
-def cmd_listen(_token: str, args: argparse.Namespace) -> int:
-    """Socket Mode listener. Bot token is resolved by main(); app token opens the socket."""
+def _post_webhook(url: str, payload: Dict[str, Any]) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SlackError(f"HTTP {exc.code} posting webhook: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise SlackError(f"Network error posting webhook: {exc.reason}") from exc
+
+
+def _import_websockets():
     try:
         import websockets
         from websockets.exceptions import ConnectionClosed
     except ImportError as exc:
         raise SlackError(
-            "listen requires the optional 'websockets' package. "
+            "Socket Mode requires the optional 'websockets' package. "
             "Install with: pip install websockets"
         ) from exc
+    return websockets, ConnectionClosed
 
+
+def _bot_identity(token: str) -> Dict[str, Optional[str]]:
+    auth = api_call("auth.test", token)
+    return {
+        "user_id": auth.get("user_id"),
+        "bot_id": auth.get("bot_id"),
+    }
+
+
+async def _socket_mode_run(
+    *,
+    app_token: str,
+    self_user_id: Optional[str],
+    self_bot_id: Optional[str],
+    once: bool,
+    stop: Dict[str, bool],
+    allow_from: Optional[List[str]] = None,
+    events_log: Optional[Path] = None,
+    on_human: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> int:
+    """Reconnecting Socket Mode loop. Never treats disconnect as a --once success."""
+    websockets, ConnectionClosed = _import_websockets()
+
+    def _log_unknown(event_type: str) -> None:
+        print(f"gbot-slack: ignoring unknown Events API type: {event_type}", file=sys.stderr)
+
+    while not stop["flag"]:
+        url = _open_socket_url(app_token)
+        try:
+            async with websockets.connect(url) as websocket:
+                async for raw in websocket:
+                    if stop["flag"]:
+                        return 0
+                    try:
+                        envelope = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    envelope_id = envelope.get("envelope_id")
+                    if envelope_id:
+                        await websocket.send(json.dumps({"envelope_id": envelope_id}))
+                    envelope_type = envelope.get("type")
+                    if envelope_type == "hello":
+                        continue
+                    if envelope_type == "disconnect":
+                        # Reconnect; do not treat as --once completion.
+                        break
+                    if events_log is not None and envelope_type == "events_api":
+                        try:
+                            append_events_log(events_log, envelope)
+                        except OSError as exc:
+                            print(f"gbot-slack: events-log write failed: {exc}", file=sys.stderr)
+                    summary = _human_event_summary(
+                        envelope,
+                        self_user_id=self_user_id,
+                        self_bot_id=self_bot_id,
+                        allow_from=allow_from,
+                        on_unknown=_log_unknown,
+                    )
+                    if not summary:
+                        continue
+                    if on_human is not None:
+                        on_human(summary)
+                    else:
+                        print_json_line(summary)
+                    if once:
+                        return 0
+        except ConnectionClosed:
+            if stop["flag"]:
+                return 0
+            # Dropped socket is not a human event — reconnect (including --once).
+            continue
+        if stop["flag"]:
+            return 0
+        # disconnect break or clean socket end: reconnect unless stopping
+        continue
+    return 0
+
+
+def _install_stop_handlers(stop: Dict[str, bool], pidfile: Optional[Path]) -> Callable[[], None]:
+    previous_int = signal.getsignal(signal.SIGINT)
+    previous_term = signal.getsignal(signal.SIGTERM)
+
+    def _handle(_signum: int, _frame: Any) -> None:
+        stop["flag"] = True
+        if pidfile is not None:
+            release_pidfile(pidfile)
+
+    signal.signal(signal.SIGINT, _handle)
+    signal.signal(signal.SIGTERM, _handle)
+
+    def _restore() -> None:
+        signal.signal(signal.SIGINT, previous_int)
+        signal.signal(signal.SIGTERM, previous_term)
+
+    return _restore
+
+
+def cmd_listen(token: str, args: argparse.Namespace) -> int:
+    """Socket Mode listener. Bot token identifies self; app token opens the socket."""
+    _import_websockets()
     app_token = resolve_app_token()
+    identity = _bot_identity(token)
+    pidfile = acquire_pidfile()
     once = bool(args.once)
     stop = {"flag": False}
+    restore = _install_stop_handlers(stop, pidfile)
+    try:
+        return asyncio.run(
+            _socket_mode_run(
+                app_token=app_token,
+                self_user_id=identity.get("user_id"),
+                self_bot_id=identity.get("bot_id"),
+                once=once,
+                stop=stop,
+            )
+        )
+    finally:
+        restore()
+        release_pidfile(pidfile)
 
-    def _handle_sigint(_signum: int, _frame: Any) -> None:
-        stop["flag"] = True
 
-    previous = signal.signal(signal.SIGINT, _handle_sigint)
+def cmd_gateway(token: str, args: argparse.Namespace) -> int:
+    """Channel transport only: Socket Mode in, JSON/webhook out. No model calls."""
+    _import_websockets()
+    app_token = resolve_app_token()
+    identity = _bot_identity(token)
+    pidfile = acquire_pidfile()
+    once = bool(args.once)
+    webhook = (args.webhook or "").strip() or None
+    allow_from = list(args.allow_from or [])
+    events_log = Path(args.events_log).expanduser() if args.events_log else None
+    stop = {"flag": False}
+    restore = _install_stop_handlers(stop, pidfile)
 
-    async def _run() -> int:
-        while not stop["flag"]:
-            url = _open_socket_url(app_token)
-            try:
-                async with websockets.connect(url) as websocket:
-                    async for raw in websocket:
-                        if stop["flag"]:
-                            return 0
-                        try:
-                            envelope = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue
-                        envelope_id = envelope.get("envelope_id")
-                        if envelope_id:
-                            await websocket.send(json.dumps({"envelope_id": envelope_id}))
-                        envelope_type = envelope.get("type")
-                        if envelope_type in {"hello", "disconnect"}:
-                            if envelope_type == "disconnect":
-                                break
-                            continue
-                        summary = _user_message_summary(envelope)
-                        if not summary:
-                            continue
-                        print_json_line(summary)
-                        if once:
-                            return 0
-            except ConnectionClosed:
-                if once or stop["flag"]:
-                    return 0
-                continue
-            if once or stop["flag"]:
-                return 0
-        return 0
+    def _emit(summary: Dict[str, Any]) -> None:
+        print_json_line(summary)
+        if webhook:
+            _post_webhook(webhook, summary)
 
     try:
-        return asyncio.run(_run())
+        return asyncio.run(
+            _socket_mode_run(
+                app_token=app_token,
+                self_user_id=identity.get("user_id"),
+                self_bot_id=identity.get("bot_id"),
+                once=once,
+                stop=stop,
+                allow_from=allow_from or None,
+                events_log=events_log,
+                on_human=_emit,
+            )
+        )
     finally:
-        signal.signal(signal.SIGINT, previous)
+        restore()
+        release_pidfile(pidfile)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gbot-slack",
         description=(
-            "Send and receive Slack messages as a bot identity via the Web API. "
-            "Bot token from SLACK_BOT_TOKEN, GBOT_SLACK_TOKEN_FILE, or "
-            f"{DEFAULT_TOKEN_PATH}. Socket Mode listen also needs an app-level "
+            "External Slack channel adapter for a host agent (transport only — "
+            "this CLI does not think or call a model). Bot token from "
+            "SLACK_BOT_TOKEN, GBOT_SLACK_TOKEN_FILE, or "
+            f"{DEFAULT_TOKEN_PATH}. Socket Mode gateway/listen also needs an app-level "
             f"token (SLACK_APP_TOKEN / {DEFAULT_APP_TOKEN_PATH})."
         ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"gbot-slack {VERSION}",
     )
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("whoami", help="Call auth.test and print bot identity")
@@ -569,13 +859,50 @@ def build_parser() -> argparse.ArgumentParser:
         "listen",
         help=(
             "Socket Mode event stream (requires pip install websockets + app token). "
-            "Prints message/app_mention JSON lines; --once exits after the first."
+            "Ignores self/bot echoes; reconnects until a human event (or SIGINT). "
+            "Prefer 'gateway' for turn-based hosts."
         ),
     )
     listen.add_argument(
         "--once",
         action="store_true",
-        help="Exit after the first user message / app_mention event",
+        help="Exit after the first human message / app_mention (not on disconnect)",
+    )
+
+    gateway = sub.add_parser(
+        "gateway",
+        help=(
+            "Socket Mode channel transport only (does not think / call a model); "
+            "emits JSON or --once exit for the host agent"
+        ),
+        description=(
+            "External channel adapter only: own the Slack Socket Mode websocket, "
+            "filter bot echoes, emit one JSON human event per line (or exit on "
+            "--once). Does not think, call a model, keep session memory, or invoke "
+            "an agent runtime — the host agent wakes and responds via send/react/thinking."
+        ),
+    )
+    gateway.add_argument(
+        "--once",
+        action="store_true",
+        help="Exit 0 after the first human event (reconnects on dropped sockets)",
+    )
+    gateway.add_argument(
+        "--webhook",
+        metavar="URL",
+        help="POST each human event JSON to URL (stays up unless --once)",
+    )
+    gateway.add_argument(
+        "--allow-from",
+        action="append",
+        default=[],
+        metavar="ID",
+        help="Slack user ID allowlist (repeatable); if set, ignore other humans",
+    )
+    gateway.add_argument(
+        "--events-log",
+        metavar="PATH",
+        help="Append raw envelope summaries for debugging (never logs tokens)",
     )
     return parser
 
@@ -591,6 +918,7 @@ COMMANDS = {
     "unreact": cmd_unreact,
     "thinking": cmd_thinking,
     "listen": cmd_listen,
+    "gateway": cmd_gateway,
 }
 
 
