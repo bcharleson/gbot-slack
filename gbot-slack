@@ -755,7 +755,7 @@ def cmd_listen(token: str, args: argparse.Namespace) -> int:
 
 
 def cmd_gateway(token: str, args: argparse.Namespace) -> int:
-    """Always-on (or --once) Socket Mode gateway: filter noise, emit human events."""
+    """Channel transport only: Socket Mode in, JSON/webhook out. No model calls."""
     _import_websockets()
     app_token = resolve_app_token()
     identity = _bot_identity(token)
@@ -794,8 +794,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gbot-slack",
         description=(
-            "Send and receive Slack messages as a bot identity via the Web API. "
-            "Bot token from SLACK_BOT_TOKEN, GBOT_SLACK_TOKEN_FILE, or "
+            "External Slack channel adapter for a host agent (transport only — "
+            "this CLI does not think or call a model). Bot token from "
+            "SLACK_BOT_TOKEN, GBOT_SLACK_TOKEN_FILE, or "
             f"{DEFAULT_TOKEN_PATH}. Socket Mode gateway/listen also needs an app-level "
             f"token (SLACK_APP_TOKEN / {DEFAULT_APP_TOKEN_PATH})."
         ),
@@ -871,9 +872,14 @@ def build_parser() -> argparse.ArgumentParser:
     gateway = sub.add_parser(
         "gateway",
         help=(
-            "Socket Mode channel gateway for turn-based agents "
-            "(single-instance pidfile, ignore self/bot, reconnect, JSON stdout). "
-            "Requires pip install websockets + app token."
+            "Socket Mode channel transport only (does not think / call a model); "
+            "emits JSON or --once exit for the host agent"
+        ),
+        description=(
+            "External channel adapter only: own the Slack Socket Mode websocket, "
+            "filter bot echoes, emit one JSON human event per line (or exit on "
+            "--once). Does not think, call a model, keep session memory, or invoke "
+            "an agent runtime — the host agent wakes and responds via send/react/thinking."
         ),
     )
     gateway.add_argument(

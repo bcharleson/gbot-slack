@@ -1,12 +1,14 @@
 # gbot-slack
 
-Tiny Python 3 CLI so any agent can send and receive Slack messages **as itself** through its own Slack bot app.
+Tiny Python 3 CLI so a **host agent** can send and receive Slack messages **as itself** through its own Slack bot app.
 
-This is a shared adapter: one Slack app per agent identity, tokens supplied by the operator and kept local. Agent-agnostic. No telemetry. No hardcoded workspace IDs.
+**gbot-slack does not think.** The host agent thinks. This repo is only an external **channel adapter** (a transport): it owns the Slack connection, filters noise, emits inbound events, and posts outbound messages the host already decided to send. It does **not** add an agent runtime, LLM calls, session memory, or an OpenClaw-style “gateway invokes the model.” Slack (and similar surfaces such as Teams or WhatsApp) are transports; the host agent is what responds.
+
+This is a shared, org-agnostic adapter: one Slack app per agent identity, tokens supplied by the operator and kept local. No telemetry. No hardcoded workspace IDs. No client-specific data in the repo.
 
 - **v1** — poll/read + send over the Slack Web API (stdlib only)
-- **v2** — Socket Mode `listen`, emoji `react` / `unreact`, and assistant `thinking` status
-- **v3** — `gateway`: single-instance Socket Mode channel layer for turn-based agents (ignore self/bot echoes, reconnect until a human event, optional webhook / allowlist)
+- **v2** — Socket Mode `listen`, emoji `react` / `unreact`, and assistant `thinking` status (Slack UI status text — not model inference)
+- **v3** — `gateway`: single-instance Socket Mode channel transport for turn-based hosts (ignore self/bot echoes, reconnect until a human event, optional webhook / allowlist)
 
 ## Requirements
 
@@ -170,9 +172,9 @@ gbot-slack thinking CHANNEL THREAD_TS ""
 
 Scope: `chat:write` is enough per Slack’s 2026 changelog. `assistant:write` is optional/legacy and will stop being accepted for this method.
 
-### Gateway (Socket Mode — recommended receive path)
+### Gateway (Socket Mode — inbound transport)
 
-`gateway` owns the Slack WebSocket, filters noise, and either exits on the first human message (`--once`) or stays up and forwards events (`--webhook` and/or stdout stream).
+`gateway` owns the Slack WebSocket, filters bot echoes and other noise, and either exits on the first human message (`--once`) or stays up and forwards events (`--webhook` and/or stdout stream). It never calls a model.
 
 ```bash
 pip install websockets   # once, for gateway/listen
@@ -182,9 +184,11 @@ gbot-slack gateway --allow-from U01234567 --allow-from U89ABCDEF
 gbot-slack gateway --events-log ~/.config/gbot-slack/events.log
 ```
 
-**Turn-based hosts (Grok Bot and similar):** run `gbot-slack gateway --once`. When it prints one JSON object and exits 0, the host agent wakes, replies with `gbot-slack send` / `react` / `thinking`, then starts `gateway --once` again.
+**Turn-based host pattern:** run `gbot-slack gateway --once`. When it prints one JSON object and exits 0, the **existing host agent** wakes on process exit, decides what to say (that logic stays in the host — not here), replies with the outbound CLI (`gbot-slack send` / `react` / `thinking`), then starts `gateway --once` again.
 
-Contrast: OpenClaw’s gateway invokes the model itself; **this** gateway only owns the channel and emits events — your host decides when to call the model.
+Inbound = this CLI. Outbound = this CLI. Reasoning = the host agent only.
+
+Unlike gateways that invoke the model inside the channel process, **gbot-slack only moves bytes on the wire**: emit JSON (or POST `--webhook`), then get out of the way.
 
 Each human event is one JSON object on stdout with `type`, `event_type`, `channel`, `user`, `ts`, `text`, and `thread_ts`. Behavior that matters in production:
 
@@ -226,7 +230,7 @@ python3 -m unittest test_gbot_slack.py
 
 ## Versioning
 
-v1 was poll/send. v2 added `listen` / `react` / `thinking`. This release is **v3** (`gbot-slack --version`): `gateway` as the durable receive path, with listen fixed to the same human-event filters. Stdlib commands still need no pip packages.
+v1 was poll/send. v2 added `listen` / `react` / `thinking`. This release is **v3** (`gbot-slack --version`): `gateway` as the durable inbound transport, with listen fixed to the same human-event filters. Still transport-only — no agent runtime. Stdlib commands still need no pip packages.
 
 ## License
 
