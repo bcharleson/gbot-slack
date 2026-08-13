@@ -1,0 +1,24 @@
+# Secrets and local credentials — never commit
+.env
+.env.*
+*.token
+bot-token
+.config/
+.credentials/
+credentials
+credentials.*
+secret
+secrets/
+*.pem
+*.key
+
+# Local / editor
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.Python
+.idea/
+.vscode/
+*.swp
+.DS_Store
