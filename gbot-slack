@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""gbot-slack — tiny Slack Web API CLI for bot-token agents (stdlib only)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+SLACK_API = "https://slack.com/api"
+DEFAULT_TOKEN_PATH = Path.home() / ".config" / "gbot-slack" / "bot-token"
+USER_AGENT = "gbot-slack/1.0"
+
+
+class SlackError(Exception):
+    """Slack API or local configuration error."""
+
+
+def resolve_token() -> str:
+    env_token = os.environ.get("SLACK_BOT_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    file_path = os.environ.get("GBOT_SLACK_TOKEN_FILE", "").strip()
+    path = Path(file_path).expanduser() if file_path else DEFAULT_TOKEN_PATH
+    if path.is_file():
+        token = path.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    raise SlackError(
+        "No bot token found. Set SLACK_BOT_TOKEN, or GBOT_SLACK_TOKEN_FILE, "
+        f"or put the token in {DEFAULT_TOKEN_PATH}"
+    )
+
+
+def api_call(method: str, token: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = {k: v for k, v in (params or {}).items() if v is not None}
+    request = urllib.request.Request(
+        f"{SLACK_API}/{method}",
+        data=urllib.parse.urlencode(payload, doseq=True).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "User-Agent": USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise SlackError(f"HTTP {exc.code} calling {method}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise SlackError(f"Network error calling {method}: {exc.reason}") from exc
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SlackError(f"Invalid JSON from {method}") from exc
+    if not data.get("ok"):
+        parts = [f"Slack API error from {method}: {data.get('error', 'unknown_error')}"]
+        if data.get("needed"):
+            parts.append(f"needed={data['needed']}")
+        if data.get("provided"):
+            parts.append(f"provided={data['provided']}")
+        raise SlackError(" ".join(parts))
+    return data
+
+
+def paginate(
+    method: str,
+    token: str,
+    params: Optional[Dict[str, Any]] = None,
+    collection_key: str = "channels",
+    page_size: int = 200,
+) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    cursor = ""
+    base = dict(params or {})
+    base["limit"] = str(page_size)
+    while True:
+        if cursor:
+            base["cursor"] = cursor
+        else:
+            base.pop("cursor", None)
+        data = api_call(method, token, base)
+        items.extend(data.get(collection_key) or [])
+        cursor = (data.get("response_metadata") or {}).get("next_cursor") or ""
+        if not cursor:
+            return items
+
+
+def looks_like_channel_id(value: str) -> bool:
+    return len(value) >= 2 and value[0] in {"C", "D", "G"} and value[1:].isalnum()
+
+
+def resolve_channel_id(token: str, channel: str) -> str:
+    name = channel.strip()
+    if not name:
+        raise SlackError("Channel is required")
+    if looks_like_channel_id(name):
+        return name
+    if name.startswith("#"):
+        name = name[1:]
+    channels = paginate(
+        "conversations.list",
+        token,
+        {"types": "public_channel,private_channel,mpim,im", "exclude_archived": "true"},
+    )
+    lowered = name.lower()
+    for entry in channels:
+        if (entry.get("name") or "").lower() == lowered:
+            return entry["id"]
+    raise SlackError(
+        f"Channel #{name} not found among conversations this bot can see. "
+        "Invite the bot or use a channel ID (C…/D…/G…)."
+    )
+
+
+def print_json(data: Any) -> None:
+    json.dump(data, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def require_limit(value: Optional[int], default: int = 20) -> int:
+    limit = default if value is None else value
+    if limit < 1:
+        raise SlackError("limit must be >= 1")
+    return limit
+
+
+def cmd_whoami(token: str, _args: argparse.Namespace) -> int:
+    data = api_call("auth.test", token)
+    print_json(
+        {
+            "ok": True,
+            "url": data.get("url"),
+            "team": data.get("team"),
+            "user": data.get("user"),
+            "team_id": data.get("team_id"),
+            "user_id": data.get("user_id"),
+            "bot_id": data.get("bot_id"),
+        }
+    )
+    return 0
+
+
+def cmd_send(token: str, args: argparse.Namespace) -> int:
+    text = " ".join(args.message).strip()
+    if not text:
+        raise SlackError("Message text is required")
+    channel_id = resolve_channel_id(token, args.channel)
+    data = api_call("chat.postMessage", token, {"channel": channel_id, "text": text})
+    print_json(
+        {
+            "ok": True,
+            "channel": data.get("channel"),
+            "ts": data.get("ts"),
+            "message": (data.get("message") or {}).get("text"),
+        }
+    )
+    return 0
+
+
+def cmd_history(token: str, args: argparse.Namespace) -> int:
+    channel_id = resolve_channel_id(token, args.channel)
+    limit = require_limit(args.limit)
+    data = api_call("conversations.history", token, {"channel": channel_id, "limit": str(limit)})
+    messages = [
+        {
+            "ts": message.get("ts"),
+            "user": message.get("user") or message.get("bot_id"),
+            "text": message.get("text"),
+            "subtype": message.get("subtype"),
+        }
+        for message in (data.get("messages") or [])
+    ]
+    print_json({"ok": True, "channel": channel_id, "messages": messages})
+    return 0
+
+
+def cmd_channels(token: str, _args: argparse.Namespace) -> int:
+    channels = paginate(
+        "conversations.list",
+        token,
+        {"types": "public_channel,private_channel", "exclude_archived": "true"},
+    )
+    rows = [
+        {
+            "id": entry.get("id"),
+            "name": entry.get("name"),
+            "is_private": bool(entry.get("is_private")),
+            "is_member": bool(entry.get("is_member")),
+            "num_members": entry.get("num_members"),
+        }
+        for entry in channels
+    ]
+    rows.sort(key=lambda item: (item.get("name") or "").lower())
+    print_json({"ok": True, "channels": rows})
+    return 0
+
+
+def cmd_dms(token: str, args: argparse.Namespace) -> int:
+    limit = require_limit(args.limit)
+    ims = paginate(
+        "conversations.list",
+        token,
+        {"types": "im", "exclude_archived": "true"},
+    )
+    rows = []
+    for entry in ims[:limit]:
+        channel_id = entry.get("id")
+        last_text = last_ts = last_user = None
+        try:
+            history = api_call(
+                "conversations.history",
+                token,
+                {"channel": channel_id, "limit": "1"},
+            )
+            messages = history.get("messages") or []
+            if messages:
+                last = messages[0]
+                last_text = last.get("text")
+                last_ts = last.get("ts")
+                last_user = last.get("user") or last.get("bot_id")
+        except SlackError:
+            pass
+        rows.append(
+            {
+                "id": channel_id,
+                "user": entry.get("user"),
+                "last_ts": last_ts,
+                "last_user": last_user,
+                "last_text": last_text,
+            }
+        )
+    print_json({"ok": True, "dms": rows})
+    return 0
+
+
+def cmd_mentions(token: str, args: argparse.Namespace) -> int:
+    limit = require_limit(args.limit)
+    auth = api_call("auth.test", token)
+    query = f"<@{auth['user_id']}>" if auth.get("user_id") else f"@{auth.get('user') or ''}"
+    try:
+        data = api_call(
+            "search.messages",
+            token,
+            {"query": query, "count": str(min(limit, 100)), "sort": "timestamp"},
+        )
+    except SlackError as exc:
+        detail = str(exc)
+        if any(code in detail for code in ("missing_scope", "not_allowed_token_type")):
+            print(
+                "search.messages is unavailable for this token (common for bot tokens).\n"
+                "v1 has no Events API / Socket Mode. Instead:\n"
+                "  - invite the bot to channels of interest\n"
+                "  - use: gbot-slack history CHANNEL [limit]\n"
+                "  - or: gbot-slack channels / gbot-slack dms\n"
+                f"Detail: {detail}",
+                file=sys.stderr,
+            )
+            return 2
+        raise
+    matches = ((data.get("messages") or {}).get("matches")) or []
+    rows = [
+        {
+            "channel": (match.get("channel") or {}).get("id")
+            or (match.get("channel") or {}).get("name"),
+            "ts": match.get("ts"),
+            "user": match.get("user"),
+            "text": match.get("text"),
+            "permalink": match.get("permalink"),
+        }
+        for match in matches[:limit]
+    ]
+    print_json({"ok": True, "query": query, "mentions": rows})
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gbot-slack",
+        description=(
+            "Send and receive Slack messages as a bot identity via the Web API. "
+            "Token from SLACK_BOT_TOKEN, GBOT_SLACK_TOKEN_FILE, or "
+            f"{DEFAULT_TOKEN_PATH}."
+        ),
+    )
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("whoami", help="Call auth.test and print bot identity")
+    send = sub.add_parser("send", help="Post a message with chat.postMessage")
+    send.add_argument("channel", help="Channel ID (C…/D…/G…) or #name")
+    send.add_argument("message", nargs="+", help="Message text")
+    history = sub.add_parser("history", help="Fetch conversations.history")
+    history.add_argument("channel", help="Channel ID (C…/D…/G…) or #name")
+    history.add_argument("limit", nargs="?", type=int, default=20)
+    dms = sub.add_parser("dms", help="List IM conversations and last message")
+    dms.add_argument("limit", nargs="?", type=int, default=20)
+    mentions = sub.add_parser(
+        "mentions",
+        help="Best-effort search for bot mentions (may require search scope)",
+    )
+    mentions.add_argument("limit", nargs="?", type=int, default=20)
+    sub.add_parser("channels", help="List conversations the bot can see")
+    return parser
+
+
+COMMANDS = {
+    "whoami": cmd_whoami,
+    "send": cmd_send,
+    "history": cmd_history,
+    "dms": cmd_dms,
+    "mentions": cmd_mentions,
+    "channels": cmd_channels,
+}
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(list(argv) if argv is not None else None)
+    if not args.command:
+        parser.print_help()
+        return 0
+    try:
+        return COMMANDS[args.command](resolve_token(), args)
+    except SlackError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
