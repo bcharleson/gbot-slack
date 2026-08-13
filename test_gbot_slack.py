@@ -211,6 +211,38 @@ class HumanEventFilterTests(unittest.TestCase):
         )
         self.assertIsNone(summary)
 
+    def test_first_delivery_retry_attempt_zero_not_ignored(self):
+        # Slack Socket Mode often includes retry_attempt=0 on first delivery.
+        summary = self.summarize(
+            _events_api(
+                {
+                    "type": "message",
+                    "user": "U_HUMAN",
+                    "channel": "D1",
+                    "ts": "1.0",
+                    "thread_ts": "0.9",
+                    "text": "sweeet!",
+                },
+                retry_attempt=0,
+                retry_reason="",
+            )
+        )
+        self.assertIsNotNone(summary)
+        assert summary is not None
+        self.assertEqual(summary["text"], "sweeet!")
+
+    def test_is_retry_envelope_requires_positive_attempt_or_reason(self):
+        self.assertFalse(cli._is_retry_envelope({}))
+        self.assertFalse(cli._is_retry_envelope({"retry_attempt": 0}))
+        self.assertFalse(cli._is_retry_envelope({"retry_attempt": 0, "retry_reason": ""}))
+        self.assertFalse(cli._is_retry_envelope({"retry_reason": ""}))
+        self.assertFalse(cli._is_retry_envelope({"retry_attempt": "1"}))
+        self.assertTrue(cli._is_retry_envelope({"retry_attempt": 1}))
+        self.assertTrue(cli._is_retry_envelope({"retry_reason": "http_error"}))
+        self.assertTrue(
+            cli._is_retry_envelope({"retry_attempt": 0, "retry_reason": "timeout"})
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

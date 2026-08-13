@@ -462,9 +462,13 @@ def release_pidfile(path: Path = DEFAULT_PIDFILE) -> None:
 
 
 def _is_retry_envelope(envelope: Dict[str, Any]) -> bool:
-    if envelope.get("retry_attempt") is not None:
+    # Socket Mode often sends retry_attempt=0 (and empty retry_reason) on the
+    # first delivery; only real retries have attempt > 0 or a non-empty reason.
+    attempt = envelope.get("retry_attempt")
+    if isinstance(attempt, int) and attempt > 0:
         return True
-    if envelope.get("retry_reason"):
+    reason = envelope.get("retry_reason")
+    if isinstance(reason, str) and reason:
         return True
     return False
 
